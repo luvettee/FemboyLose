@@ -33,7 +33,6 @@ jobs:
         working-directory: source
         shell: pwsh
         run: |
-          $src = (Get-Location).Path
           msbuild neverlose.sln `
             /p:Configuration=Release `
             /p:Platform=x86 `
@@ -42,7 +41,7 @@ jobs:
             /p:DebugInformationFormat=None `
             /p:GenerateDebugInformation=false `
             /p:LinkIncremental=false `
-            "/p:AdditionalOptions=/Brepro /pathmap:$src=." `
+            /p:AdditionalOptions="/Brepro" `
             /p:AdditionalLinkerOptions="/BREPRO" `
             /m
 
@@ -55,6 +54,9 @@ jobs:
       - name: Show toolchain versions
         shell: pwsh
         run: |
+          echo "ImageOS=$env:ImageOS"
+          echo "ImageVersion=$env:ImageVersion"
+          systeminfo | findstr /B /C:"OS Name" /C:"OS Version"
           msbuild -version
           rustc --version
           cargo --version
@@ -66,7 +68,6 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            source/server/rust-server/target
           key: rust-${{ hashFiles('source/server/rust-server/Cargo.lock') }}
           restore-keys: rust-
 
@@ -74,8 +75,7 @@ jobs:
         working-directory: source/server/rust-server
         shell: pwsh
         run: |
-          $src = (Get-Location).Path
-          $env:RUSTFLAGS = "--remap-path-prefix=$src=."
+          $env:RUSTFLAGS = "-Clink-arg=/Brepro"
           cargo build --release --locked
 
       - name: Install msvcpp-normalize-pe
@@ -149,8 +149,10 @@ jobs:
 
             Compare the hashes against `SHA256SUMS.txt`.
 
-            ### Reproducing the build
+            ### Source commit
 
-            To reproduce this release yourself, clone the source repository, check out commit `${{ env.SOURCE_COMMIT }}`, and follow the reproducible build instructions in the source README.
+            This release was built by GitHub Actions from the public source commit listed above.
+
+            Local builds are useful for auditing and modification, but they are not currently guaranteed to be byte-for-byte identical to the official GitHub Actions release artifacts.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
