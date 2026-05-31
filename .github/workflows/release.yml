@@ -31,14 +31,18 @@ jobs:
 
       - name: Build C++ Release x86
         working-directory: source
+        shell: pwsh
         run: |
+          $src = (Get-Location).Path
           msbuild neverlose.sln `
             /p:Configuration=Release `
             /p:Platform=x86 `
             /p:PlatformToolset=v145 `
             /p:UseDebugLibraries=false `
             /p:DebugInformationFormat=None `
-            /p:AdditionalOptions="/Brepro" `
+            /p:GenerateDebugInformation=false `
+            /p:LinkIncremental=false `
+            "/p:AdditionalOptions=/Brepro /pathmap:$src=." `
             /p:AdditionalLinkerOptions="/BREPRO" `
             /m
 
@@ -47,6 +51,14 @@ jobs:
         with:
           toolchain: "1.88.0"
           targets: x86_64-pc-windows-msvc
+
+      - name: Show toolchain versions
+        shell: pwsh
+        run: |
+          msbuild -version
+          rustc --version
+          cargo --version
+          dir "C:\Program Files (x86)\Windows Kits\10\Lib"
 
       - name: Cache Rust dependencies
         uses: actions/cache@v4
@@ -60,7 +72,11 @@ jobs:
 
       - name: Build Rust server Release
         working-directory: source/server/rust-server
-        run: cargo build --release --locked
+        shell: pwsh
+        run: |
+          $src = (Get-Location).Path
+          $env:RUSTFLAGS = "--remap-path-prefix=$src=."
+          cargo build --release --locked
 
       - name: Install msvcpp-normalize-pe
         run: pip install msvcpp-normalize-pe
