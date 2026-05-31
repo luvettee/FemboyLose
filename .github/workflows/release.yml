@@ -1,0 +1,140 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-2025-vs2026
+
+    steps:
+      - name: Checkout release repo
+        uses: actions/checkout@v4
+
+      - name: Clone source from git.femboy.tw
+        shell: pwsh
+        run: |
+          git clone https://git.femboy.tw/root/FemboyLose.git source
+          echo "SOURCE_COMMIT=$(git -C source rev-parse HEAD)" >> $env:GITHUB_ENV
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+        with:
+          vs-version: '[18.0,19.0)'
+          msbuild-architecture: x64
+
+      - name: Build C++ Release x86
+        working-directory: source
+        run: |
+          msbuild neverlose.sln `
+            /p:Configuration=Release `
+            /p:Platform=Win32 `
+            /p:PlatformToolset=v145 `
+            /p:UseDebugLibraries=false `
+            /p:DebugInformationFormat=None `
+            /p:AdditionalOptions="/Brepro" `
+            /p:AdditionalLinkerOptions="/BREPRO" `
+            /m
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.87.0"
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            source/server/rust-server/target
+          key: rust-${{ hashFiles('source/server/rust-server/Cargo.lock') }}
+          restore-keys: rust-
+
+      - name: Build Rust server Release
+        working-directory: source/server/rust-server
+        run: cargo build --release --locked
+
+      - name: Install msvcpp-normalize-pe
+        run: pip install msvcpp-normalize-pe
+
+      - name: Normalize PE headers
+        working-directory: source
+        run: |
+          msvcpp-normalize-pe Release\neverlose.dll
+          msvcpp-normalize-pe Release\injector.exe
+
+      - name: Collect binaries and compute SHA256
+        shell: pwsh
+        run: |
+          $files = @(
+            "source\Release\neverlose.dll",
+            "source\Release\injector.exe",
+            "source\server\rust-server\target\release\neverlose-server.exe"
+          )
+
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+
+          $hashes = @()
+          foreach ($f in $files) {
+            if (!(Test-Path $f)) {
+              throw "Missing expected artifact: $f"
+            }
+
+            $name = Split-Path $f -Leaf
+            Copy-Item $f "dist\$name"
+
+            $hash = (Get-FileHash "dist\$name" -Algorithm SHA256).Hash.ToLower()
+            $hashes += "${hash}  ${name}"
+
+            echo "$name : $hash"
+          }
+
+          $hashes | Out-File -Encoding utf8 "dist\SHA256SUMS.txt"
+          echo "" >> dist\SHA256SUMS.txt
+          echo "Built from commit: $env:SOURCE_COMMIT" >> dist\SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/neverlose.dll
+            dist/injector.exe
+            dist/neverlose-server.exe
+            dist/SHA256SUMS.txt
+          body: |
+            ## FemboyLose ${{ github.ref_name }}
+
+            Built from [`${{ env.SOURCE_COMMIT }}`](https://git.femboy.tw/root/FemboyLose/commit/${{ env.SOURCE_COMMIT }}) on git.femboy.tw.
+
+            ### Files
+
+            | File | Purpose |
+            |------|---------|
+            | `neverlose.dll` | Main module, x86 |
+            | `injector.exe` | DLL injector, x86, requires administrator permissions |
+            | `neverlose-server.exe` | Local server, x64 |
+            | `SHA256SUMS.txt` | SHA256 hashes for verifying the release files |
+
+            ### Verifying the release
+
+            Download all three binaries and `SHA256SUMS.txt`, place them in the same folder, then run:
+
+            ```powershell
+            Get-FileHash neverlose.dll, injector.exe, neverlose-server.exe -Algorithm SHA256
+            ```
+
+            Compare the hashes against `SHA256SUMS.txt`.
+
+            ### Reproducing the build
+
+            To reproduce this release yourself, clone the source repository, check out commit `${{ env.SOURCE_COMMIT }}`, and follow the reproducible build instructions in the source README.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
