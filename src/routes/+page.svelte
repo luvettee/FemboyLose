@@ -522,7 +522,7 @@
 
             <div class="detail-body">
               <div class="metadata">
-                <p class="metadata-row with-menu">
+                <div class="metadata-row with-menu">
                   <span class="label">Branch:</span>
                   <button
                     class:active={versionOpen}
@@ -543,9 +543,9 @@
                       {/each}
                     </div>
                   {/if}
-                </p>
+                </div>
                 <p><span class="label">Updated:</span> <span class="value">{updatedAtLabel}</span></p>
-                <p class="metadata-row with-menu">
+                <div class="metadata-row with-menu">
                   <span class="label">Config:</span>
                   <button
                     class:active={configOpen}
@@ -564,7 +564,7 @@
                       {/each}
                     </div>
                   {/if}
-                </p>
+                </div>
                 <p><span class="label">Last Launch:</span> <span class="value">Just Now</span></p>
               </div>
 
@@ -1138,6 +1138,7 @@
   }
 
   .metadata p,
+  .metadata-row,
   .changelog p {
     margin: 0;
     font-size: 13px;
@@ -1145,7 +1146,8 @@
     font-weight: 300;
   }
 
-  .metadata p {
+  .metadata p,
+  .metadata-row {
     margin-bottom: 3px;
   }
 
