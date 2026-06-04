@@ -124,6 +124,58 @@ jobs:
           $isPrerelease = $tag -match "-(test|nightly|alpha|beta|rc)\.?"
           "IS_PRERELEASE=$($isPrerelease.ToString().ToLower())" >> $env:GITHUB_ENV
 
+      - name: Build release notes
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $notesPath = "release-notes\$tag.md"
+          $bodyPath = "dist\RELEASE_BODY.md"
+
+          if (Test-Path $notesPath) {
+            Get-Content $notesPath | Out-File -Encoding utf8 $bodyPath
+            "" | Out-File -Encoding utf8 -Append $bodyPath
+          } else {
+            @"
+          ## FemboyLose $tag
+
+          No manual changelog was provided for this release.
+
+          "@ | Out-File -Encoding utf8 $bodyPath
+          }
+
+          @"
+          ---
+
+          ### Build information
+
+          Built from [`$env:SOURCE_COMMIT`](https://git.femboy.tw/root/FemboyLose/commit/$env:SOURCE_COMMIT) on git.femboy.tw.
+
+          ### Files
+
+          | File | Purpose |
+          |------|---------|
+          | `neverlose.dll` | Main module, x86 |
+          | `injector.exe` | DLL injector, x86, requires administrator permissions |
+          | `neverlose-server.exe` | Local server, x64 |
+          | `SHA256SUMS.txt` | SHA256 hashes for verifying the release files |
+
+          ### Verifying the release
+
+          Download all three binaries and `SHA256SUMS.txt`, place them in the same folder, then run:
+
+          ```powershell
+          Get-FileHash neverlose.dll, injector.exe, neverlose-server.exe -Algorithm SHA256
+          ```
+
+          Compare the hashes against `SHA256SUMS.txt`.
+
+          ### Source commit
+
+          This release was built by GitHub Actions from the public source commit listed above.
+
+          Local builds are useful for auditing and modification, but they are not currently guaranteed to be byte-for-byte identical to the official GitHub Actions release artifacts.
+          "@ | Out-File -Encoding utf8 -Append $bodyPath
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -133,34 +185,6 @@ jobs:
             dist/injector.exe
             dist/neverlose-server.exe
             dist/SHA256SUMS.txt
-          body: |
-            ## FemboyLose ${{ github.ref_name }}
-
-            Built from [`${{ env.SOURCE_COMMIT }}`](https://git.femboy.tw/root/FemboyLose/commit/${{ env.SOURCE_COMMIT }}) on git.femboy.tw.
-
-            ### Files
-
-            | File | Purpose |
-            |------|---------|
-            | `neverlose.dll` | Main module, x86 |
-            | `injector.exe` | DLL injector, x86, requires administrator permissions |
-            | `neverlose-server.exe` | Local server, x64 |
-            | `SHA256SUMS.txt` | SHA256 hashes for verifying the release files |
-
-            ### Verifying the release
-
-            Download all three binaries and `SHA256SUMS.txt`, place them in the same folder, then run:
-
-            ```powershell
-            Get-FileHash neverlose.dll, injector.exe, neverlose-server.exe -Algorithm SHA256
-            ```
-
-            Compare the hashes against `SHA256SUMS.txt`.
-
-            ### Source commit
-
-            This release was built by GitHub Actions from the public source commit listed above.
-
-            Local builds are useful for auditing and modification, but they are not currently guaranteed to be byte-for-byte identical to the official GitHub Actions release artifacts.
+          body_path: dist/RELEASE_BODY.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
