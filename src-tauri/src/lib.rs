@@ -74,8 +74,8 @@ struct LauncherTheme {
 #[derive(Debug, Serialize)]
 struct LauncherSettings {
     username: String,
+    avatar_data_url: Option<String>,
     selected_config_id: Option<i32>,
-    selected_config_name: Option<String>,
     configs: Vec<ConfigEntry>,
 }
 
@@ -198,6 +198,53 @@ fn close_main_window(app: AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 fn load_launcher_settings() -> Result<LauncherSettings, String> {
+    read_launcher_settings()
+}
+
+#[tauri::command]
+fn save_launcher_profile(
+    username: String,
+    avatar_bytes: Option<Vec<u8>>,
+) -> Result<LauncherSettings, String> {
+    let username = username.trim();
+    if username.is_empty() {
+        return Err("profile name cannot be empty".to_string());
+    }
+
+    let cloud = nl_cloud_path()?;
+    fs::create_dir_all(&cloud)
+        .map_err(|error| format!("failed to create {}: {error}", cloud.display()))?;
+
+    let state_path = cloud.join("state.json");
+    let state_text = fs::read_to_string(&state_path)
+        .map_err(|error| format!("failed to read {}: {error}", state_path.display()))?;
+    let mut state_value: serde_json::Value = serde_json::from_str(&state_text)
+        .map_err(|error| format!("failed to parse {}: {error}", state_path.display()))?;
+    let Some(state_object) = state_value.as_object_mut() else {
+        return Err("state.json root was not an object".to_string());
+    };
+    state_object.insert(
+        "username".to_string(),
+        serde_json::Value::String(username.to_string()),
+    );
+    let next_state = serde_json::to_string_pretty(&state_value)
+        .map_err(|error| format!("failed to serialize {}: {error}", state_path.display()))?;
+    fs::write(&state_path, next_state)
+        .map_err(|error| format!("failed to write {}: {error}", state_path.display()))?;
+
+    if let Some(bytes) = avatar_bytes {
+        if bytes.is_empty() {
+            return Err("profile image was empty".to_string());
+        }
+        let avatar_path = cloud.join("avatar.png");
+        fs::write(&avatar_path, bytes)
+            .map_err(|error| format!("failed to write {}: {error}", avatar_path.display()))?;
+    }
+
+    read_launcher_settings()
+}
+
+fn read_launcher_settings() -> Result<LauncherSettings, String> {
     let cloud = nl_cloud_path()?;
     let state_path = cloud.join("state.json");
     let state_text = fs::read_to_string(&state_path)
@@ -215,18 +262,43 @@ fn load_launcher_settings() -> Result<LauncherSettings, String> {
         })
         .collect::<Vec<_>>();
 
-    let selected_config_name = state
-        .last_loaded_config_id
-        .and_then(|id| configs.iter().find(|config| config.entry_id == id))
-        .map(|config| config.name.clone())
-        .or_else(|| configs.first().map(|config| config.name.clone()));
-
     Ok(LauncherSettings {
         username: state.username,
+        avatar_data_url: load_avatar_data_url(&cloud)?,
         selected_config_id: state.last_loaded_config_id,
-        selected_config_name,
         configs,
     })
+}
+
+fn load_avatar_data_url(cloud: &Path) -> Result<Option<String>, String> {
+    let avatar_path = cloud.join("avatar.png");
+    if !avatar_path.exists() {
+        return Ok(None);
+    }
+
+    let bytes = fs::read(&avatar_path)
+        .map_err(|error| format!("failed to read {}: {error}", avatar_path.display()))?;
+    let mime = image_mime_type(&bytes).unwrap_or("image/png");
+    Ok(Some(format!(
+        "data:{mime};base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    )))
+}
+
+fn image_mime_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        return Some("image/png");
+    }
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some("image/jpeg");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    None
 }
 
 #[tauri::command]
@@ -279,7 +351,11 @@ fn load_git_metadata() -> Result<LauncherGitMetadata, String> {
 }
 
 #[tauri::command]
-fn download_and_launch_version(tag: String, config_id: Option<i32>, appid: i32) -> Result<(), String> {
+fn download_and_launch_version(
+    tag: String,
+    config_id: Option<i32>,
+    appid: i32,
+) -> Result<(), String> {
     if tag.trim().is_empty() || tag == "Unavailable" {
         return Err("no release version is selected".to_string());
     }
@@ -469,7 +545,8 @@ fn kill_background_processes() -> Result<(), String> {
 fn restart_csgo(appid: i32) -> Result<(), String> {
     close_csgo_if_running()?;
 
-    let steam_dir = steam_install_dir().ok_or_else(|| "failed to find Steam install path".to_string())?;
+    let steam_dir =
+        steam_install_dir().ok_or_else(|| "failed to find Steam install path".to_string())?;
     let steam = steam_dir.join("steam.exe");
     
     let protocol_string = match appid {
@@ -825,6 +902,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             load_launcher_theme,
             load_launcher_settings,
+            save_launcher_profile,
             load_git_metadata,
             download_and_launch_version,
             minimize_main_window,

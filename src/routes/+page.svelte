@@ -1,6 +1,8 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import { fade, scale } from 'svelte/transition';
   import { invoke } from '@tauri-apps/api/core';
+  import { openUrl } from '@tauri-apps/plugin-opener';
   import { getCurrentWindow } from '@tauri-apps/api/window';
 
   type Branch = 'Release' | 'Nightly';
@@ -24,12 +26,25 @@
     size: number;
   };
 
+  const WEBSITE_URL = 'https://gs.femboy.tw';
+  const DISCORD_URL = 'https://discord.gg/YzDpcsEhCE';
+  const API_DOCS_URL = 'https://docs-csgo.neverlose.cc/';
+
   let view = $state<View>('boot');
   let game = $state<Game>('csgo');
   let branch = $state<Branch>('Release');
   let branchOpen = $state(false);
   let versionOpen = $state(false);
   let configOpen = $state(false);
+  let profileOpen = $state(false);
+  let profileSaving = $state(false);
+  let profileError = $state('');
+  let username = $state('Player');
+  let profileNameInput = $state('');
+  let avatarDataUrl = $state('');
+  let avatarDataUrlBeforeEdit = $state('');
+  let pendingAvatarBytes = $state<number[] | null>(null);
+  let avatarInput = $state<HTMLInputElement | null>(null);
   let configs = $state<ConfigEntry[]>([]);
   let selectedConfigId = $state<number | null>(null);
   let gitMetadata = $state<LauncherGitMetadata>({
@@ -56,7 +71,7 @@
   const updatedAtLabel = $derived(formatGitDate(selectedVersionData?.updated_at));
   const changelogEntries = $derived(parseChangelog(selectedVersionData?.changelog));
   const selectedReleaseUrl = $derived(selectedVersionData?.url ?? '');
-  const appWindow = getCurrentWindow();
+  const appWindow = getOptionalCurrentWindow();
 
   type LauncherTheme = {
     source: string;
@@ -65,8 +80,8 @@
 
   type LauncherSettings = {
     username: string;
+    avatar_data_url: string | null;
     selected_config_id: number | null;
-    selected_config_name: string | null;
     configs: ConfigEntry[];
   };
 
@@ -74,6 +89,18 @@
     releases: LauncherVersion[];
     nightlies: LauncherVersion[];
   };
+
+  function getOptionalCurrentWindow() {
+    try {
+      return getCurrentWindow();
+    } catch {
+      return null;
+    }
+  }
+
+  function hasTauriRuntime() {
+    return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+  }
 
   onMount(() => {
     const blockContextMenu = (event: MouseEvent) => {
@@ -103,7 +130,11 @@
     const closeFloatingMenus = (event: MouseEvent) => {
       const target = event.target as HTMLElement;
 
-      if (target.closest('.branch-trigger, .branch-menu, .metadata-trigger, .metadata-menu, .changelog a')) {
+      if (
+        target.closest(
+          '.branch-trigger, .branch-menu, .metadata-trigger, .metadata-menu, .changelog a, .profile-trigger, .profile-popout'
+        )
+      ) {
         return;
       }
 
@@ -141,6 +172,10 @@
   }
 
   async function loadTheme() {
+    if (!hasTauriRuntime()) {
+      return;
+    }
+
     try {
       const theme = await invoke<LauncherTheme>('load_launcher_theme');
       themeVariables = Object.entries(theme.variables)
@@ -152,16 +187,47 @@
   }
 
   async function loadSettings() {
+    if (!hasTauriRuntime()) {
+      profileNameInput = username;
+      return;
+    }
+
     try {
       const settings = await invoke<LauncherSettings>('load_launcher_settings');
-      configs = settings.configs;
-      selectedConfigId = settings.selected_config_id ?? settings.configs[0]?.entry_id ?? null;
+      applyLauncherSettings(settings);
     } catch (error) {
       console.warn('Failed to load launcher settings', error);
     }
   }
 
+  function applyLauncherSettings(settings: LauncherSettings) {
+    username = settings.username || 'Player';
+    profileNameInput = username;
+    avatarDataUrl = settings.avatar_data_url ?? avatarDataUrl;
+    avatarDataUrlBeforeEdit = avatarDataUrl;
+    configs = settings.configs;
+    selectedConfigId = settings.selected_config_id ?? settings.configs[0]?.entry_id ?? null;
+  }
+
   async function loadGitMetadata() {
+    if (!hasTauriRuntime()) {
+      gitMetadata = {
+        releases: [
+          {
+            tag: 'Unavailable',
+            name: 'Unavailable',
+            changelog: 'Git metadata is loaded from Tauri.',
+            updated_at: '',
+            url: '',
+            assets: []
+          }
+        ],
+        nightlies: []
+      };
+      selectedVersion = 'Unavailable';
+      return;
+    }
+
     try {
       const metadata = await invoke<LauncherGitMetadata>('load_git_metadata');
       gitMetadata = metadata;
@@ -188,12 +254,18 @@
   async function minimizeWindow(event?: MouseEvent) {
     event?.preventDefault();
     event?.stopPropagation();
+    if (!hasTauriRuntime()) {
+      return;
+    }
     await invoke('minimize_main_window');
   }
 
   async function closeWindow(event?: MouseEvent) {
     event?.preventDefault();
     event?.stopPropagation();
+    if (!hasTauriRuntime()) {
+      return;
+    }
     await invoke('close_main_window');
   }
 
@@ -265,6 +337,171 @@
     configOpen = false;
   }
 
+  async function openExternal(url: string) {
+    if (!url) {
+      return;
+    }
+
+    if (!hasTauriRuntime()) {
+      window.open(url, '_blank', 'noreferrer');
+      return;
+    }
+
+    try {
+      await openUrl(url);
+    } catch (error) {
+      console.warn('Failed to open link', error);
+    }
+  }
+
+  function openProfile(event: MouseEvent) {
+    event.stopPropagation();
+    profileNameInput = username;
+    avatarDataUrlBeforeEdit = avatarDataUrl;
+    pendingAvatarBytes = null;
+    profileError = '';
+    branchOpen = false;
+    versionOpen = false;
+    configOpen = false;
+    profileOpen = !profileOpen;
+  }
+
+  function chooseAvatar() {
+    avatarInput?.click();
+  }
+
+  async function handleAvatarChange(event: Event) {
+    const input = event.currentTarget as HTMLInputElement;
+    const file = input.files?.[0];
+    if (!file) {
+      return;
+    }
+
+    if (!file.type.startsWith('image/')) {
+      profileError = 'Choose an image file.';
+      input.value = '';
+      return;
+    }
+
+    try {
+      const rounded = await roundedAvatarPng(file);
+      pendingAvatarBytes = Array.from(rounded.bytes);
+      avatarDataUrl = rounded.dataUrl;
+      profileError = '';
+    } catch (error) {
+      profileError = String(error);
+    } finally {
+      input.value = '';
+    }
+  }
+
+  function cancelProfileEdit() {
+    profileNameInput = username;
+    avatarDataUrl = avatarDataUrlBeforeEdit;
+    pendingAvatarBytes = null;
+    profileError = '';
+  }
+
+  async function roundedAvatarPng(file: File) {
+    const source = await fileToDataUrl(file);
+    const image = await loadImage(source);
+    const size = 256;
+    const canvas = document.createElement('canvas');
+    canvas.width = size;
+    canvas.height = size;
+    const context = canvas.getContext('2d');
+    if (!context) {
+      throw new Error('Could not prepare profile image.');
+    }
+
+    const edge = Math.min(image.naturalWidth, image.naturalHeight);
+    const sx = (image.naturalWidth - edge) / 2;
+    const sy = (image.naturalHeight - edge) / 2;
+    context.clearRect(0, 0, size, size);
+    context.save();
+    context.beginPath();
+    context.arc(size / 2, size / 2, size / 2, 0, Math.PI * 2);
+    context.clip();
+    context.drawImage(image, sx, sy, edge, edge, 0, 0, size, size);
+    context.restore();
+
+    const dataUrl = canvas.toDataURL('image/png');
+    const response = await fetch(dataUrl);
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    return { bytes, dataUrl };
+  }
+
+  function loadImage(src: string) {
+    return new Promise<HTMLImageElement>((resolve, reject) => {
+      const image = new Image();
+      image.onload = () => resolve(image);
+      image.onerror = () => reject(new Error('Could not load profile image.'));
+      image.src = src;
+    });
+  }
+
+  function fileToDataUrl(file: File) {
+    return new Promise<string>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result ?? ''));
+      reader.onerror = () => reject(reader.error);
+      reader.readAsDataURL(file);
+    });
+  }
+
+  async function saveProfile() {
+    const nextUsername = profileNameInput.trim();
+    if (!nextUsername) {
+      profileError = 'Enter a profile name.';
+      return;
+    }
+
+    profileSaving = true;
+    profileError = '';
+    if (!hasTauriRuntime()) {
+      username = nextUsername;
+      profileNameInput = username;
+      avatarDataUrlBeforeEdit = avatarDataUrl;
+      pendingAvatarBytes = null;
+      profileSaving = false;
+      return;
+    }
+
+    try {
+      const settings = await invoke<LauncherSettings>('save_launcher_profile', {
+        username: nextUsername,
+        avatarBytes: pendingAvatarBytes
+      });
+      applyLauncherSettings(settings);
+      pendingAvatarBytes = null;
+    } catch (error) {
+      profileError = String(error);
+    } finally {
+      profileSaving = false;
+    }
+  }
+
+  async function saveProfileName() {
+    if (profileSaving || profileNameInput.trim() === username) {
+      return;
+    }
+    await saveProfile();
+  }
+
+  function handleProfileNameKeydown(event: KeyboardEvent) {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      void saveProfileName();
+      return;
+    }
+
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      profileNameInput = username;
+      profileError = '';
+    }
+  }
+
   function launch(appid: number) {
     branchOpen = false;
     launchPending = true;
@@ -308,7 +545,7 @@
       finished = true;
       progress = 100;
       window.setTimeout(() => {
-        void appWindow.close().catch(() => undefined);
+        void appWindow?.close().catch(() => undefined);
       }, 1800);
     } catch (error) {
       console.warn('Failed to launch selected version', error);
@@ -327,6 +564,11 @@
     branchOpen = false;
     versionOpen = false;
     configOpen = false;
+    if (profileOpen && pendingAvatarBytes) {
+      avatarDataUrl = avatarDataUrlBeforeEdit;
+      pendingAvatarBytes = null;
+    }
+    profileOpen = false;
   }
 
   function formatGitDate(value: string | undefined) {
@@ -404,7 +646,7 @@
     }
 
     event.preventDefault();
-    void appWindow.startDragging().catch(() => undefined);
+    void appWindow?.startDragging().catch(() => undefined);
   }
 
   function isInteractiveElement(element: HTMLElement) {
@@ -454,11 +696,24 @@
   </svg>
 {/snippet}
 
+{#snippet IconConstruction()}
+  <svg viewBox="0 0 24 24" aria-hidden="true">
+    <rect x="2" y="6" width="20" height="8" rx="1" />
+    <path d="M17 14v7" />
+    <path d="M7 14v7" />
+    <path d="M17 3v3" />
+    <path d="M7 3v3" />
+    <path d="M10 14 2.3 6.3" />
+    <path d="M14 6l8 8" />
+    <path d="M8 6l8 8" />
+  </svg>
+{/snippet}
+
 <svelte:head>
   <title>Neverlose Launcher</title>
 </svelte:head>
 
-{#if branchOpen || versionOpen || configOpen}
+{#if branchOpen || versionOpen || configOpen || profileOpen}
   <button class="click-away" aria-label="Close menu" onclick={closeBranchFromBackdrop}></button>
 {/if}
 
@@ -482,15 +737,83 @@
       <div class="logo" data-tauri-drag-region>BS</div>
 
       <nav class="side-nav" aria-label="Navigation">
-        <button>Website</button>
-        <button>Support</button>
+        <button onclick={() => openExternal(WEBSITE_URL)}>Website</button>
+        <button onclick={() => openExternal(DISCORD_URL)}>Support</button>
         <button>Market</button>
       </nav>
 
-      <div class="profile">
-        <div class="avatar"></div>
-        <span>Placeholder</span>
-      </div>
+      <button class:active={profileOpen} class="profile profile-trigger" data-no-drag onclick={openProfile}>
+        <span class="avatar">
+          {#if avatarDataUrl}
+            <img src={avatarDataUrl} alt="" draggable="false" />
+          {/if}
+        </span>
+        <span>{username}</span>
+      </button>
+
+      {#if profileOpen}
+        <button
+          class="background-dim visible profile-dim"
+          aria-label="Close profile settings"
+          onclick={closeMenus}
+          transition:fade={{ duration: 210 }}
+        ></button>
+        <section
+          class="profile-popout"
+          data-no-drag
+          aria-label="Profile settings"
+          transition:scale={{ duration: 220, start: 0.985, opacity: 0 }}
+        >
+          <button aria-label="Close profile settings" class="detail-close profile-close" onclick={closeMenus}>
+            {@render IconClose()}
+          </button>
+
+          <div class="profile-content">
+            <button class="avatar profile-popout-avatar" aria-label="Change profile image" onclick={chooseAvatar}>
+              {#if avatarDataUrl}
+                <img src={avatarDataUrl} alt="" draggable="false" />
+              {/if}
+              <span>Change</span>
+            </button>
+            <input
+              bind:this={avatarInput}
+              class="avatar-file"
+              type="file"
+              accept="image/png,image/jpeg,image/gif,image/webp"
+              onchange={handleAvatarChange}
+            />
+
+            <div class="profile-name-card">
+              <input
+                bind:value={profileNameInput}
+                maxlength="32"
+                spellcheck="false"
+                aria-label="Profile name"
+                onblur={saveProfileName}
+                onkeydown={handleProfileNameKeydown}
+              />
+            </div>
+
+            {#if profileError}
+              <p class="profile-error">{profileError}</p>
+            {/if}
+
+            {#if pendingAvatarBytes}
+              <div class="profile-actions">
+                <button onclick={cancelProfileEdit} disabled={profileSaving}>Cancel</button>
+                <button class="save-profile" onclick={saveProfile} disabled={profileSaving}>
+                  {profileSaving ? 'Saving...' : 'Save'}
+                </button>
+              </div>
+            {/if}
+
+            <div class="profile-wip">
+              {@render IconConstruction()}
+              <span>Work In Progress</span>
+            </div>
+          </div>
+        </section>
+      {/if}
 
       <div class="window-controls" data-no-drag>
         <button aria-label="Minimize" class="minimize" data-no-drag onclick={minimizeWindow}><span></span></button>
@@ -510,11 +833,11 @@
         </button>
 
         <button class="subscription-card active" onclick={() => (game = 'csgo') && openDetails()}>
-            <span>
+          <span>
             <strong>Counter-Strike: Global Offensive</strong>
             <em>Expires Never</em>
-            </span>
-            <img class="game-icon" src="/csgo.png" alt="" draggable="false" />
+          </span>
+          <img class="game-icon" src="/csgo.png" alt="" draggable="false" />
         </button>
 
       </section>
@@ -608,8 +931,8 @@
 
             <footer>
               <div class="footer-links">
-                <button>Community</button>
-                <button>API Documentation</button>
+                <button onclick={() => openExternal(DISCORD_URL)}>Community</button>
+                <button onclick={() => openExternal(API_DOCS_URL)}>API Documentation</button>
               </div>
 
               <div class="actions">
@@ -655,7 +978,9 @@
   {/if}
 </main>
 
-<style>
+<style lang="postcss">
+  @reference "../app.css";
+
   @font-face {
     font-family: "Museo Sans Local";
     font-style: normal;
@@ -769,24 +1094,11 @@
   }
 
   .click-away {
-    position: fixed;
-    inset: 0;
-    z-index: 5;
-    padding: 0;
-    border: 0;
-    background: transparent;
+    @apply fixed inset-0 z-[5] border-0 bg-transparent p-0;
   }
 
   .shell {
-    position: fixed;
-    left: 50%;
-    top: 50%;
-    z-index: 10;
-    width: 260px;
-    height: 260px;
-    overflow: hidden;
-    border-radius: 9px;
-    background: var(--nl-main-bg-opaque);
+    @apply fixed left-1/2 top-1/2 z-10 h-[260px] w-[260px] overflow-hidden rounded-[9px] bg-[var(--nl-main-bg-opaque)];
     box-shadow:
       0 0 0 1px color-mix(in srgb, var(--nl-shadow), transparent 78%),
       0 0 16px color-mix(in srgb, var(--nl-shadow), transparent 72%),
@@ -799,15 +1111,11 @@
   }
 
   .shell.expanded {
-    width: 530px;
-    height: 400px;
+    @apply h-[400px] w-[530px];
   }
 
   .boot-view {
-    position: absolute;
-    inset: 0;
-    display: grid;
-    place-items: center;
+    @apply absolute inset-0 grid place-items-center;
   }
 
   .boot-view > * {
@@ -815,23 +1123,16 @@
   }
 
   .boot-spinner {
-    position: relative;
-    width: 34px;
-    height: 34px;
-    border-radius: 999px;
-    animation: spin 1400ms linear infinite;
+    @apply relative size-[34px] rounded-full animate-[spin_1400ms_linear_infinite];
   }
 
   .boot-spinner svg {
-    width: 100%;
-    height: 100%;
-    color: var(--nl-spinner);
+    @apply size-full text-[var(--nl-spinner)];
     filter: drop-shadow(0 0 7px rgba(150, 164, 255, 0.22));
   }
 
   .boot-spinner circle {
-    fill: none;
-    stroke: currentColor;
+    @apply fill-none stroke-current;
     stroke-width: 4;
     stroke-linecap: round;
     stroke-dasharray: 1 107;
@@ -841,49 +1142,32 @@
   }
 
   .launcher-view {
-    position: absolute;
-    inset: 0;
+    @apply absolute inset-0;
     opacity: 0;
     animation: fade-in 280ms 170ms ease-in-out both;
   }
 
   .logo {
-    position: absolute;
-    left: 22px;
-    top: 22px;
+    @apply absolute left-[22px] top-[22px] text-[38px] font-black leading-none text-[var(--nl-logo)];
     font-family: "Museo Sans Local", "Museo Sans Cyrl", "Museo Sans Cyrillic", "Museo Sans", "Inter Variable", Inter, sans-serif;
-    font-size: 38px;
-    font-weight: 900;
-    line-height: 1;
-    color: var(--nl-logo);
     text-shadow: none;
   }
 
   .side-nav {
-    position: absolute;
-    left: 18px;
-    top: 105px;
-    display: grid;
-    gap: 16px;
+    @apply absolute left-[18px] top-[105px] grid gap-4;
   }
 
   .side-nav button,
   .footer-links button {
-    padding: 0;
-    border: 0;
-    background: transparent;
-    font-size: 13px;
-    font-weight: 300;
-    text-align: left;
-    transition: color 130ms ease-in-out;
+    @apply border-0 bg-transparent p-0 text-left text-[13px] font-light transition-colors duration-[130ms] ease-in-out;
   }
 
   .side-nav button {
-    color: var(--nl-text);
+    @apply text-[var(--nl-text)];
   }
 
   .footer-links button {
-    color: var(--nl-text);
+    @apply text-[var(--nl-text)];
   }
 
   .side-nav button:hover,
@@ -892,22 +1176,20 @@
   }
 
   .profile {
-    position: absolute;
-    left: 20px;
-    bottom: 20px;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    font-size: 14px;
-    font-weight: 100;
-    line-height: 28px;
-    color: var(--nl-active-text);
+    @apply absolute bottom-5 left-5 flex w-[132px] items-center gap-2 border-0 bg-transparent p-0 text-left text-sm font-thin leading-7 text-[var(--nl-active-text)] transition-opacity duration-[130ms] ease-in-out;
+  }
+
+  .profile:hover,
+  .profile.active {
+    @apply opacity-[0.82];
+  }
+
+  .profile span:last-child {
+    @apply min-w-0 overflow-hidden text-ellipsis whitespace-nowrap;
   }
 
   .avatar {
-    width: 40px;
-    height: 40px;
-    border-radius: 999px;
+    @apply relative block size-10 flex-none overflow-hidden rounded-full;
     background:
       radial-gradient(circle at 50% 36%, rgba(255, 255, 255, 0.82) 0 10%, transparent 11%),
       radial-gradient(circle at 38% 50%, #efe1d6 0 13%, transparent 14%),
@@ -915,30 +1197,122 @@
       radial-gradient(circle at 50% 70%, #1d1d25 0 25%, transparent 26%),
       linear-gradient(135deg, #c9cbd2, #4b4d57);
     box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.18);
-    opacity: 0.9;
+    @apply opacity-90;
   }
 
+  .avatar img {
+    @apply block size-full object-cover;
+  }
+
+  .profile-popout {
+    @apply absolute left-1/2 top-1/2 z-10 h-[340px] w-[460px] overflow-hidden rounded-[10px] border border-[rgba(255,255,255,0.075)];
+    background: var(--nl-block-bg-opaque);
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.018),
+      0 18px 42px var(--nl-shadow-soft);
+    transform: translate(-50%, -50%);
+  }
+
+  .profile-close {
+    @apply right-[15px] top-[18px];
+  }
+
+  .profile-content {
+    @apply absolute right-5 bottom-[17px] left-5 top-[46px];
+  }
+
+  .profile-popout-avatar {
+    @apply mx-auto size-[84px] border-0 p-0 opacity-100;
+    box-shadow:
+      inset 0 0 0 1px rgba(255, 255, 255, 0.2),
+      0 10px 28px color-mix(in srgb, var(--nl-shadow), transparent 22%);
+  }
+
+  .profile-popout-avatar::before {
+    content: "";
+    @apply absolute inset-0 z-[1] rounded-full bg-black/0 transition-colors duration-150 ease-in-out;
+  }
+
+  .profile-popout-avatar span {
+    @apply absolute inset-x-0 bottom-0 z-[2] translate-y-full bg-black/[0.72] pt-[5px] pb-[7px] text-center text-[10px] font-medium leading-none text-white transition-transform duration-[170ms] ease-in-out;
+  }
+
+  .profile-popout-avatar:hover::before {
+    @apply bg-black/[0.28];
+  }
+
+  .profile-popout-avatar:hover span {
+    @apply translate-y-0;
+  }
+
+  .avatar-file {
+    @apply hidden;
+  }
+
+  .profile-name-card {
+    @apply mt-3 grid h-[32px] place-items-center;
+  }
+
+  .profile-name-card input {
+    @apply h-[32px] w-[178px] box-border rounded-[5px] border border-transparent bg-transparent px-2.5 py-0 text-center text-[15px] font-medium text-[var(--nl-active-text)] outline-0 transition-[background,border-color] duration-[130ms] ease-in-out;
+  }
+
+  .profile-name-card input:hover,
+  .profile-name-card input:focus {
+    background: color-mix(in srgb, var(--nl-main-bg-opaque), white 4%);
+    border-color: color-mix(in srgb, var(--nl-link), white 18%);
+  }
+
+  .profile-error {
+    @apply mt-[7px] mb-0 text-center text-[11px] leading-[1.35] text-[#ff8d8d];
+  }
+
+  .profile-actions {
+    @apply mt-[10px] flex justify-center gap-2;
+  }
+
+  .profile-actions button {
+    @apply h-7 min-w-[62px] rounded-md border border-[var(--nl-border)] bg-transparent px-2.5 py-0 text-xs font-light text-[var(--nl-text)] transition-[background,color,opacity] duration-[130ms] ease-in-out;
+  }
+
+  .profile-actions button:hover {
+    color: color-mix(in srgb, var(--nl-text), var(--nl-active-text) 50%);
+  }
+
+  .profile-actions button:disabled {
+    @apply opacity-[0.55];
+  }
+
+  .profile-actions .save-profile {
+    @apply border-transparent bg-[var(--nl-button)] text-[var(--nl-button-active-text)];
+  }
+
+  .profile-actions .save-profile:hover {
+    background: var(--nl-button-active);
+    color: var(--nl-button-active-text);
+  }
+
+  .profile-wip {
+    @apply absolute inset-x-0 bottom-2 flex items-center justify-center gap-2 text-[12px] font-light text-[var(--nl-small-text)];
+  }
+
+  .profile-wip svg {
+    @apply size-[15px];
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.8;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+
+
   .window-controls {
-    position: absolute;
-    right: 17px;
-    top: 15px;
-    display: flex;
-    gap: 8px;
-    align-items: center;
-    z-index: 15;
+    @apply absolute right-[17px] top-[15px] z-[15] flex items-center gap-2;
   }
 
   .window-controls button,
   .detail-close {
-    display: grid;
-    place-items: center;
-    width: 24px;
-    height: 24px;
-    padding: 0;
-    border: 0;
-    color: var(--nl-text);
-    background: transparent;
-    transition: color 120ms ease-in-out, opacity 120ms ease-in-out;
+    @apply grid size-6 place-items-center border-0 bg-transparent p-0 text-[var(--nl-text)] transition-[color,opacity] duration-[120ms] ease-in-out;
   }
 
   .minimize::before {
@@ -946,11 +1320,7 @@
   }
 
   .minimize span {
-    display: block;
-    width: 12px;
-    height: 1.5px;
-    border-radius: 999px;
-    background: currentColor;
+    @apply block h-[1.5px] w-3 rounded-full bg-current;
   }
 
   .minimize:hover {
@@ -972,108 +1342,56 @@
   }
 
   .subscriptions {
-    position: absolute;
-    left: 176px;
-    top: 16px;
-    width: 323px;
+    @apply absolute left-44 top-4 w-[323px];
   }
 
   .subscriptions h1 {
-    margin: 0;
-    font-size: 19px;
-    font-weight: 500;
-    line-height: 1.7;
-    transform: translateX(7px);
-    color: var(--nl-active-text);
+    @apply m-0 translate-x-[7px] text-[19px] font-medium leading-[1.7] text-[var(--nl-active-text)];
   }
 
   .subscriptions > p {
-    margin: 6px 0 45px;
-    color: var(--nl-text);
-    font-size: 14.5px;
-    font-weight: 300;
-    transform: translateX(7px);
+    @apply mt-1.5 mb-[45px] translate-x-[7px] text-[14.5px] font-light text-[var(--nl-text)];
   }
 
   .subscription-card {
-    position: relative;
-    display: block;
-    width: 100%;
-    height: 73px;
-    margin: 0 0 11px;
-    padding: 0;
-    overflow: hidden;
-    border: 0.5px solid var(--nl-border);
-    border-radius: 12px;
-    background: var(--nl-block-bg);
+    @apply relative mb-[11px] block h-[73px] w-full overflow-hidden rounded-xl border-[0.5px] border-solid border-[var(--nl-border)] bg-[var(--nl-block-bg)] p-0 text-left;
     box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.018);
-    text-align: left;
   }
 
   .subscription-card.active {
-    cursor: default;
+    @apply cursor-default;
     animation: card-in 360ms 260ms ease-in-out both;
     transition: none;
   }
 
   .subscription-card span {
-    position: absolute;
-    left: 12px;
-    top: 8px;
+    @apply absolute left-3 top-2;
   }
 
   .subscription-card strong {
-    display: block;
-    color: var(--nl-active-text);
-    font-size: 13.5px;
-    font-weight: 500;
+    @apply block text-[13.5px] font-medium text-[var(--nl-active-text)];
   }
 
   .subscription-card em {
-    display: block;
-    margin-top: 9px;
-    color: var(--nl-text-preview);
-    font-size: 13px;
-    font-weight: 100;
-    font-style: normal;
+    @apply mt-[9px] block text-[13px] font-thin not-italic text-[var(--nl-text-preview)];
   }
 
   .game-icon {
-    position: absolute;
-    right: 10px;
-    top: 11px;
-    width: 22px;
-    height: 22px;
-    border-radius: 5px;
-    object-fit: cover;
+    @apply pointer-events-none absolute right-2.5 top-[11px] size-[22px] rounded-[5px] object-cover;
     box-shadow: 0 0 18px rgba(240, 139, 11, 0.2);
-    pointer-events: none;
   }
 
   .background-dim {
-    position: absolute;
-    inset: 0;
-    z-index: 8;
-    background: rgba(0, 0, 0, 0);
-    cursor: default;
+    @apply absolute inset-0 z-[8] cursor-default border-0 bg-black/0 p-0;
     transition: background 360ms var(--ease-soft);
   }
 
   .background-dim.visible {
-    background: rgba(0, 0, 0, 0.66);
+    @apply bg-[rgba(0,0,0,0.66)];
   }
 
   .details {
-    position: absolute;
-    left: 50%;
-    top: 50%;
-    z-index: 10;
-    width: 460px;
-    height: 340px;
-    overflow: hidden;
-    border: 1px solid rgba(255, 255, 255, 0.075);
-    border-radius: 10px;
-    background: var(--nl-block-bg-opaque);
+    @apply absolute left-1/2 top-1/2 z-10 h-[340px] w-[460px] overflow-hidden rounded-[10px] border border-[rgba(255,255,255,0.075)] bg-[var(--nl-block-bg-opaque)];
     transform: translate(-50%, -50%);
     animation: panel-in 320ms var(--ease-smooth) both;
     transition:
@@ -1086,134 +1404,85 @@
   }
 
   .details.launching {
-    width: 375px;
-    height: 250px;
-    border-radius: 4px;
-    background: var(--nl-block-bg-opaque);
+    @apply h-[250px] w-[375px] rounded bg-[var(--nl-block-bg-opaque)] pointer-events-none;
     animation: none;
-    pointer-events: none;
   }
 
   .details.closing {
+    @apply opacity-0 pointer-events-none;
     animation: none;
-    opacity: 0;
     transform: translate(-50%, -50%) scale(0.985);
-    pointer-events: none;
     transition:
       opacity 210ms var(--ease-soft),
       transform 240ms var(--ease-smooth);
   }
 
   .detail-content {
-    position: absolute;
-    inset: 0;
-    z-index: 1;
-    opacity: 1;
+    @apply absolute inset-0 z-[1] opacity-100;
     transition: opacity 280ms var(--ease-soft), transform 320ms var(--ease-smooth);
     transform: translateY(0) scale(1);
   }
 
   .details.fading .detail-content {
-    opacity: 0;
+    @apply opacity-0 pointer-events-none;
     transform: translateY(2px) scale(0.995);
-    pointer-events: none;
   }
 
   .details header {
-    position: relative;
-    height: 70px;
-    border-bottom: 1px solid var(--nl-separator);
+    @apply relative h-[70px] border-b border-[var(--nl-separator)];
   }
 
   .details .large {
-    left: 17px;
-    top: 19px;
-    width: 30px;
-    height: 30px;
-    border-radius: 8px;
+    @apply left-[17px] top-[19px] size-[30px] rounded-lg;
   }
 
   .details h2 {
-    position: absolute;
-    left: 58px;
-    top: 50%;
-    margin: 0;
-    font-size: 18px;
-    font-weight: 500;
-    color: var(--nl-active-text);
-    transform: translateY(-50%);
+    @apply absolute left-[58px] top-1/2 m-0 -translate-y-1/2 text-lg font-medium text-[var(--nl-active-text)];
   }
 
   .detail-close {
-    position: absolute;
-    right: 15px;
-    top: 25px;
-    font-size: 18px;
+    @apply absolute right-[15px] top-[25px] text-lg;
   }
 
   .detail-body {
-    display: grid;
-    grid-template-columns: 197px 1fr;
-    gap: 0;
-    padding: 16px 20px 0;
+    @apply grid grid-cols-[197px_1fr] gap-0 px-5 pt-4 pb-0;
   }
 
   .metadata p,
   .metadata-row,
   .changelog p {
-    margin: 0;
-    font-size: 13px;
-    line-height: 1.85;
-    font-weight: 300;
+    @apply m-0 text-[13px] font-light leading-[1.85];
   }
 
   .metadata p,
   .metadata-row {
-    margin-bottom: 3px;
+    @apply mb-[3px];
   }
 
   .metadata-row {
-    position: relative;
+    @apply relative;
   }
 
   .metadata-row.with-menu {
-    display: flex;
-    align-items: center;
-    gap: 4px;
-    flex-wrap: nowrap;
+    @apply flex flex-nowrap items-center gap-1;
   }
 
   .metadata .label {
-    color: var(--nl-active-text);
-    font-weight: 300;
-    flex: 0 0 auto;
+    @apply flex-none font-light text-[var(--nl-active-text)];
   }
 
   .metadata .value {
-    color: var(--nl-link-active);
-    font-weight: 500;
-    margin-left: 4px;
+    @apply ml-1 font-medium text-[var(--nl-link-active)];
   }
 
   .metadata-trigger {
-    display: inline-grid;
+    @apply m-0 inline-grid h-[22px] max-w-[150px] items-center gap-1.5 rounded-[5px] bg-transparent px-[7px] py-0 text-left font-medium text-[var(--nl-link-active)] align-middle;
     grid-template-columns: 15px minmax(0, auto);
-    align-items: center;
-    gap: 6px;
-    max-width: 150px;
-    height: 22px;
-    padding: 0 7px;
-    margin: 0;
     border: 1px solid color-mix(in srgb, var(--nl-border), var(--nl-text) 14%);
-    border-radius: 5px;
-    color: var(--nl-link-active);
-    background: transparent;
     box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--nl-border), transparent 45%);
     font: inherit;
     font-weight: 500;
-    text-align: left;
     transition: background 130ms ease-in-out, border-color 130ms ease-in-out, box-shadow 130ms ease-in-out, color 130ms ease-in-out;
-    vertical-align: middle;
   }
 
   .metadata-trigger:focus {
@@ -1226,9 +1495,7 @@
   }
 
   .metadata-trigger span:last-child {
-    overflow: hidden;
-    white-space: nowrap;
-    text-overflow: ellipsis;
+    @apply overflow-hidden text-ellipsis whitespace-nowrap;
   }
 
   .metadata-trigger:hover {
@@ -1254,11 +1521,7 @@
   }
 
   .trigger-icon {
-    display: block;
-    width: 15px;
-    height: 15px;
-    justify-self: center;
-    color: currentColor;
+    @apply block size-[15px] justify-self-center text-current;
   }
 
   .branch-icon-small {
@@ -1272,24 +1535,13 @@
   }
 
   .cog-icon-small svg {
-    width: 15px;
-    height: 15px;
+    @apply size-[15px];
     stroke-width: 1.65;
   }
 
   .metadata-menu {
-    position: absolute;
-    left: 68px;
-    top: 28px;
-    z-index: 35;
-    width: max-content;
-    min-width: 132px;
-    max-width: 196px;
-    max-height: 116px;
-    overflow: auto;
-    padding: 6px 0;
+    @apply absolute left-[68px] top-7 z-[35] max-h-[116px] w-max min-w-[132px] max-w-[196px] overflow-auto rounded-[10px] py-1.5;
     border: 1px solid color-mix(in srgb, var(--nl-button-active), transparent 84%);
-    border-radius: 10px;
     background: color-mix(in srgb, var(--nl-popup-bg), transparent 22%);
     box-shadow:
       0 0 14px color-mix(in srgb, var(--nl-button-active), transparent 94%),
@@ -1299,7 +1551,7 @@
     scrollbar-width: thin;
     scrollbar-color: color-mix(in srgb, var(--nl-active-text), transparent 78%) transparent;
     transform-origin: left top;
-    animation: menu-in 145ms var(--ease-smooth) both;
+    animation: menu-in 190ms ease-in-out both;
   }
 
   .config-menu {
@@ -1308,45 +1560,48 @@
   }
 
   .metadata-menu button {
-    display: block;
-    width: 100%;
-    height: 26px;
-    padding: 0 11px;
-    border: 0;
-    color: var(--nl-disabled-text);
-    background: transparent;
-    font-size: 13px;
-    font-weight: 300;
-    text-align: left;
-    overflow: hidden;
-    white-space: nowrap;
-    text-overflow: ellipsis;
-    transition: color 130ms ease-in-out, text-shadow 130ms ease-in-out;
+    @apply relative isolate mx-0 block h-[26px] w-full overflow-hidden text-ellipsis whitespace-nowrap rounded-none border-0 bg-transparent px-[11px] py-0 text-left text-[13px] font-light text-[var(--nl-text-preview)];
+    transition: background 130ms ease-in-out, color 130ms ease-in-out, text-shadow 130ms ease-in-out;
+  }
+
+  .metadata-menu button::before {
+    @apply pointer-events-none absolute inset-y-0 left-2 right-2 z-[-1] rounded-[5px] opacity-0;
+    content: "";
+    background: var(--nl-selection);
+    transition: opacity 130ms ease-in-out;
   }
 
   .metadata-menu button:hover {
-    color: color-mix(in srgb, var(--nl-active-text), var(--nl-disabled-text) 50%);
+    color: color-mix(in srgb, var(--nl-active-text), var(--nl-text-preview) 50%);
+    background: transparent;
     text-shadow: 0 0 10px color-mix(in srgb, var(--nl-active-text), transparent 86%);
+  }
+
+  .metadata-menu button:hover::before {
+    @apply opacity-50;
+  }
+
+  .metadata-menu button:active {
+    color: var(--nl-active-text);
   }
 
   .metadata-menu .selected,
   .metadata-menu .selected:hover {
     color: var(--nl-active-text);
+    text-shadow: none;
+  }
+
+  .metadata-menu button:active::before,
+  .metadata-menu .selected:active::before {
+    @apply opacity-100;
   }
 
   .metadata-menu button:disabled {
-    color: var(--nl-disabled-text);
-    opacity: 0.58;
-    pointer-events: none;
+    @apply pointer-events-none text-[var(--nl-text-preview)] opacity-[0.58];
   }
 
   .changelog {
-    max-height: 154px;
-    overflow-x: hidden;
-    overflow-y: auto;
-    padding-right: 8px;
-    color: var(--nl-text);
-    overflow-wrap: anywhere;
+    @apply max-h-[154px] overflow-x-hidden overflow-y-auto break-words pr-2 text-[var(--nl-text)];
     mask-image: linear-gradient(to bottom, #000 0%, #000 calc(100% - 22px), transparent 100%);
     -webkit-mask-image: linear-gradient(to bottom, #000 0%, #000 calc(100% - 22px), transparent 100%);
     scrollbar-width: thin;
@@ -1403,14 +1658,7 @@
   }
 
   .details footer {
-    position: absolute;
-    left: 17px;
-    right: 17px;
-    bottom: 15px;
-    height: 28px;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
+    @apply absolute right-[17px] bottom-[15px] left-[17px] flex h-7 items-center justify-between;
   }
 
   .footer-links {
@@ -1428,14 +1676,7 @@
 
   .branch-trigger,
   .load {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    height: 28px;
-    border-radius: 6px;
-    color: var(--nl-button-active-text);
-    font-size: 13px;
-    font-weight: 300;
+    @apply inline-flex h-7 items-center justify-center rounded-md text-[13px] font-light text-[var(--nl-button-active-text)];
   }
 
   .branch-trigger {
@@ -1447,8 +1688,7 @@
   }
 
   .branch-trigger svg {
-    width: 19px;
-    height: 19px;
+    @apply size-[19px];
     stroke-width: 1.65;
     stroke-linecap: round;
     stroke-linejoin: round;
@@ -1467,23 +1707,15 @@
   }
 
   .load {
-    width: 102px;
-    border: 0;
-    background: var(--nl-button);
-    transition: background 130ms ease-in-out, opacity 130ms ease-in-out;
+    @apply w-[102px] border-0 bg-[var(--nl-button)] transition-[background,opacity] duration-[130ms] ease-in-out;
   }
 
   .load .play-icon {
-    display: inline-flex;
-    margin-right: 12px;
-    margin-left: -4px;
-    color: var(--nl-button-active-text);
+    @apply mr-3 ml-[-4px] inline-flex text-[var(--nl-button-active-text)];
   }
 
   .load svg {
-    width: 18px;
-    height: 20px;
-    fill: none;
+    @apply h-5 w-[18px] fill-none;
     stroke-width: 1.5;
     stroke-linecap: round;
     stroke-linejoin: round;
@@ -1494,21 +1726,12 @@
   }
 
   .load:disabled {
-    opacity: 0.55;
-    pointer-events: none;
+    @apply pointer-events-none opacity-[0.55];
   }
 
   .branch-menu {
-    position: absolute;
-    left: 34px;
-    top: -34px;
-    z-index: 30;
-    width: 122px;
-    height: 66px;
-    padding: 8px 0 0;
-    overflow: hidden;
+    @apply absolute left-[34px] top-[-34px] z-30 h-[66px] w-[122px] overflow-hidden rounded-md pt-2;
     border: 1px solid color-mix(in srgb, var(--nl-button-active), transparent 84%);
-    border-radius: 6px;
     background: color-mix(in srgb, var(--nl-popup-bg), transparent 28%);
     box-shadow:
       0 0 14px color-mix(in srgb, var(--nl-button-active), transparent 94%),
@@ -1516,63 +1739,61 @@
       0 12px 30px var(--nl-shadow-soft);
     backdrop-filter: blur(9px);
     transform-origin: left bottom;
-    animation: menu-in 145ms var(--ease-smooth) both;
+    animation: menu-in 190ms ease-in-out both;
   }
 
   .branch-menu button {
-    display: grid;
+    @apply relative isolate mx-0 grid h-[29px] w-full items-center rounded-none border-0 bg-transparent py-0 pr-0 pl-[14px] text-left text-sm font-thin text-[var(--nl-text-preview)];
     grid-template-columns: 24px 1fr;
-    align-items: center;
     column-gap: 11px;
-    width: 100%;
-    height: 29px;
-    margin: 0;
-    padding: 0 0 0 14px;
-    border: 0;
-    border-radius: 0;
-    color: var(--nl-disabled-text);
-    background: transparent;
-    font-size: 14px;
-    font-weight: 100;
-    text-align: left;
-    transition: color 130ms ease-in-out, text-shadow 130ms ease-in-out;
+    transition: background 130ms ease-in-out, color 130ms ease-in-out, text-shadow 130ms ease-in-out;
+  }
+
+  .branch-menu button::before {
+    @apply pointer-events-none absolute inset-y-0 left-2 right-2 z-[-1] rounded-[5px] opacity-0;
+    content: "";
+    background: var(--nl-selection);
+    transition: opacity 130ms ease-in-out;
+  }
+
+  .branch-menu button > * {
+    @apply relative z-[1];
   }
 
   .branch-icon {
-    display: block;
-    width: 17px;
-    height: 17px;
-    justify-self: center;
-    background: currentColor;
+    @apply block size-[17px] justify-self-center bg-current opacity-90;
     mask: url("/git-branch.svg") center / contain no-repeat;
     -webkit-mask: url("/git-branch.svg") center / contain no-repeat;
-    opacity: 0.9;
   }
 
   .branch-menu button:hover {
-    color: color-mix(in srgb, var(--nl-active-text), var(--nl-disabled-text) 50%);
+    color: var(--nl-active-text);
     background: transparent;
     text-shadow: 0 0 10px color-mix(in srgb, var(--nl-active-text), transparent 86%);
   }
 
-  .branch-menu .selected {
+  .branch-menu button:hover::before {
+    @apply opacity-50;
+  }
+
+  .branch-menu button:active {
     color: var(--nl-active-text);
   }
 
+  .branch-menu .selected,
   .branch-menu .selected:hover {
     color: var(--nl-active-text);
+    text-shadow: none;
+  }
+
+  .branch-menu button:active::before,
+  .branch-menu .selected:active::before {
+    @apply opacity-100;
   }
 
   .launch-content {
-    position: absolute;
-    inset: 0;
     --launch-content-width: 249px;
-    z-index: 2;
-    display: grid;
-    place-items: center;
-    align-content: center;
-    opacity: 0;
-    pointer-events: none;
+    @apply pointer-events-none absolute inset-0 z-[2] grid place-items-center content-center opacity-0;
     transform: scale(0.985);
     transition:
       opacity 260ms 260ms var(--ease-soft),
@@ -1585,37 +1806,21 @@
   }
 
   .game-icon.launch {
-    position: static;
-    width: 46px;
-    height: 46px;
-    border-radius: 7px;
+    @apply static size-[46px] rounded-[7px];
     animation: launch-icon-pulse 2s var(--ease-smooth) infinite;
     transform-origin: center;
   }
 
   .launch-content p {
-    width: var(--launch-content-width);
-    margin: 30px 0 16px;
-    color: var(--nl-text);
-    font-size: 13px;
-    white-space: nowrap;
-    justify-self: center;
-    text-align: center;
+    @apply mt-[30px] mb-4 w-[var(--launch-content-width)] justify-self-center text-center text-[13px] text-[var(--nl-text)] whitespace-nowrap;
   }
 
   .progress {
-    width: var(--launch-content-width);
-    height: 4px;
-    overflow: hidden;
-    border-radius: 999px;
-    background: var(--nl-frame-bg);
+    @apply h-1 w-[var(--launch-content-width)] overflow-hidden rounded-full bg-[var(--nl-frame-bg)];
   }
 
   .progress span {
-    display: block;
-    height: 100%;
-    border-radius: inherit;
-    background: var(--nl-button);
+    @apply block h-full rounded-[inherit] bg-[var(--nl-button)];
   }
 
   @keyframes fill {
@@ -1664,12 +1869,10 @@
   @keyframes menu-in {
     from {
       opacity: 0;
-      transform: translateY(3px) scale(0.985);
     }
 
     to {
       opacity: 1;
-      transform: translateY(0) scale(1);
     }
   }
 
