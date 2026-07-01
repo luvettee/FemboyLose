@@ -36,6 +36,7 @@
 
   let view = $state<View>('boot');
   let game = $state<Game>('csgo');
+  let foundCsgo = $state(false);
   let installedStatus = $state<InstalledGames>({
     cs2_legacy_branch: false,
     csgo_standalone: false,
@@ -46,6 +47,7 @@
   let configOpen = $state(false);
   let profileOpen = $state(false);
   let profileSaving = $state(false);
+  let launchAutomatically = $state(true);
   let profileError = $state('');
   let username = $state('Player');
   let profileNameInput = $state('');
@@ -547,16 +549,24 @@
 
       view = 'launching';
       launchTimer = undefined;
-      void startLaunchProgress(versionToLaunch, configIdToLaunch, appid);
+      void startLaunchProgress(versionToLaunch, configIdToLaunch, appid, launchAutomatically);
     }, 230);
   }
 
-  async function startLaunchProgress(versionToLaunch: string, configIdToLaunch: number | null, appid: number | null) {
+  async function checkForCsgo() {
+    try {
+      foundCsgo = await invoke<boolean>('check_for_csgo');
+    } catch (error) {
+      console.warn('Could not check for csgo', error);
+    }
+  }
+
+  async function startLaunchProgress(versionToLaunch: string, configIdToLaunch: number | null, appid: number | null, autolaunch: boolean) {
     const startedAt = performance.now();
     let finished = false;
     const tick = () => {
       const elapsed = performance.now() - startedAt;
-      progress = finished ? 100 : Math.min(92, 18 + (elapsed / 3200) * 74);
+      progress = finished ? 100 : Math.min(95, 18 + (elapsed / 3200) * 74);
 
       if (!finished) {
         requestAnimationFrame(tick);
@@ -566,16 +576,25 @@
     requestAnimationFrame(tick);
 
     try {
-      await invoke('download_and_launch_version', { tag: versionToLaunch, configId: configIdToLaunch, appid });
-      // todo: wait until we see csgo.exe to determine if we're actually done
+      await invoke('download_and_launch_version', { tag: versionToLaunch, configId: configIdToLaunch, appid, autoLaunch: autolaunch });
+
+      while (true) {
+        const isRunning = await invoke<boolean>('check_for_csgo');
+          if (isRunning) {
+            foundCsgo = true;
+            break;
+          }
+      }
+
       finished = true;
       progress = 100;
       window.setTimeout(() => {
         void appWindow?.close().catch(() => undefined);
       }, 1000);
+
     } catch (error) {
       console.warn('Failed to launch selected version', error);
-      launchError = String(error);
+      launchError = typeof error === 'string' ? error : JSON.stringify(error);
       launchPending = false;
       view = 'details';
       progress = 0;
@@ -966,6 +985,10 @@
                     {/if}
                   </div>
                   <p><span class="label">Last Launch:</span> <span class="value">Just Now</span></p>
+                  <label class="checkbox-row">
+                    <span class="label">Launch Automatically</span>
+                    <input type="checkbox" bind:checked={launchAutomatically} />
+                  </label>
                 </div>
 
                 <div class="changelog">
@@ -1025,7 +1048,14 @@
 
           <div class="launch-content" aria-hidden={view !== 'launching'}>
             <img class="game-icon launch" src="/csgo.png" alt="" draggable="false" />
+            {#if launchAutomatically}
             <p>The game will be launched automatically</p>
+            {:else}
+            <p>Launch the game manually</p> <!--muhahahahah-->
+            {/if}
+            {#if foundCsgo}
+            <p>Found CS!</p>
+            {/if} <!--w code i guess-->
             <div class="progress"><span style={`width: ${progress}%`}></span></div>
           </div>
         </section>
@@ -1986,5 +2016,49 @@
 
   .launch-error-close:hover {
     color: var(--nl-active-text);
+  }
+
+   .checkbox-row {
+    @apply mt-1.5 flex cursor-pointer items-center gap-2.5 select-none w-max;
+  }
+
+  .checkbox-row .label {
+    @apply text-[13px] font-light text-[var(--nl-active-text)];
+  }
+
+  /* ai slop but looks good trust fr */
+
+  /* Hide default checkbox and style custom background/border */
+  .checkbox-row input[type="checkbox"] {
+    @apply relative m-0 flex size-4 appearance-none items-center justify-center rounded-[4px] bg-[var(--nl-main-bg-opaque)] outline-none cursor-pointer;
+    border: 1px solid color-mix(in srgb, var(--nl-border), var(--nl-text) 14%);
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--nl-border), transparent 45%);
+    transition: background 130ms ease-in-out, border-color 130ms ease-in-out, box-shadow 130ms ease-in-out;
+  }
+
+  /* Hover state */
+  .checkbox-row input[type="checkbox"]:hover {
+    border-color: transparent;
+    box-shadow: inset 0 0 0 1px transparent;
+    background: color-mix(in srgb, var(--nl-button-active), transparent 75%);
+  }
+
+  /* Checked state */
+  .checkbox-row input[type="checkbox"]:checked {
+    border-color: transparent;
+    box-shadow: inset 0 0 0 1px transparent, 0 0 10px color-mix(in srgb, var(--nl-button), transparent 60%);
+    background: var(--nl-button);
+  }
+
+  /* The Checkmark */
+  .checkbox-row input[type="checkbox"]::after {
+    content: "";
+    @apply block h-[7.5px] w-[4px] rotate-45 border-b-[1.5px] border-r-[1.5px] border-[var(--nl-button-active-text)] opacity-0 scale-50;
+    margin-bottom: 1.5px;
+    transition: opacity 130ms ease-in-out, transform 130ms var(--ease-smooth);
+  }
+
+  .checkbox-row input[type="checkbox"]:checked::after {
+    @apply opacity-100 scale-100;
   }
 </style>
