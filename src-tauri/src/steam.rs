@@ -2,6 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use crate::error::LauncherError;
+use sysinfo::{System};
 
 #[cfg(windows)]
 use winreg::RegKey;

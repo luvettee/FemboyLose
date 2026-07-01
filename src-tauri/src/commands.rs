@@ -1,9 +1,11 @@
+use sha2::digest::typenum::Or;
 use tauri::AppHandle;
 use tauri::Manager;
 use crate::error::LauncherError;
 use crate::steam;
 use crate::downloader;
 use crate::theme;
+use sysinfo::System;
 
 #[tauri::command]
 pub async fn load_launcher_theme() -> Result<theme::LauncherTheme, LauncherError> {
@@ -53,8 +55,9 @@ pub async fn download_and_launch_version(
     tag: String,
     config_id: Option<i32>,
     appid: i32,
+    auto_launch: bool,
 ) -> Result<(), LauncherError> {
-    downloader::download_and_launch_version(tag, config_id, appid).await
+    downloader::download_and_launch_version(tag, config_id, appid, auto_launch).await
 }
 
 #[tauri::command]
@@ -68,4 +71,14 @@ pub fn detect_installed_games() -> Result<steam::InstalledGames, LauncherError> 
         cs2_legacy_branch: steam::find_game_install_path("Counter-Strike Global Offensive").is_some(),
         csgo_standalone: steam::find_game_install_path("csgo legacy").is_some(),
     })
+}
+
+#[tauri::command]
+pub fn check_for_csgo() -> bool {
+    let mut sys = System::new_all();
+    sys.refresh_all();
+    
+    let x = sys.processes_by_exact_name(std::ffi::OsStr::new("csgo.exe"))
+        .next()
+        .is_some(); x // i fucking hate this shit i hope this works
 }
