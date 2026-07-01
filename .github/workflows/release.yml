@@ -1,9 +1,9 @@
-name: Build Standalone EXE
+name: Build and Release
 
 on:
   push:
     tags:
-      - "v*"
+      - 'v*'
   workflow_dispatch:
 
 permissions:
@@ -11,41 +11,158 @@ permissions:
 
 jobs:
   build:
-    runs-on: windows-latest
+    runs-on: windows-2025-vs2026
 
     steps:
-      - name: Checkout
+      - name: Checkout release repo
         uses: actions/checkout@v4
 
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
-
-      - name: Install frontend dependencies
-        run: bun install --frozen-lockfile
-
-      - name: Build standalone executable
-        run: bun run tauri build --no-bundle
-
-      - name: Collect executable
+      - name: Clone source from git.femboy.tw
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item src-tauri\target\release\neverlosetauriofficial.exe dist\NeverloseLauncher.exe
-          $hash = (Get-FileHash dist\NeverloseLauncher.exe -Algorithm SHA256).Hash.ToLower()
-          "$hash  NeverloseLauncher.exe" | Out-File -Encoding utf8 dist\SHA256SUMS.txt
+          git clone https://git.femboy.tw/root/FemboyLose.git source
+          echo "SOURCE_COMMIT=$(git -C source rev-parse HEAD)" >> $env:GITHUB_ENV
 
-      - name: Publish GitHub release
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+        with:
+          vs-version: '[18.0,19.0)'
+          msbuild-architecture: x64
+
+      - name: Build C++ Release x86
+        working-directory: source
+        shell: pwsh
+        run: |
+          msbuild neverlose.sln `
+            /p:Configuration=Release `
+            /p:Platform=x86 `
+            /p:PlatformToolset=v145 `
+            /p:UseDebugLibraries=false `
+            /p:DebugInformationFormat=None `
+            /p:GenerateDebugInformation=false `
+            /p:LinkIncremental=false `
+            /p:AdditionalOptions="/Brepro" `
+            /p:AdditionalLinkerOptions="/BREPRO" `
+            /m
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88.0"
+          targets: x86_64-pc-windows-msvc
+
+      - name: Show toolchain versions
+        shell: pwsh
+        run: |
+          echo "ImageOS=$env:ImageOS"
+          echo "ImageVersion=$env:ImageVersion"
+          systeminfo | findstr /B /C:"OS Name" /C:"OS Version"
+          msbuild -version
+          rustc --version
+          cargo --version
+          dir "C:\Program Files (x86)\Windows Kits\10\Lib"
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: rust-${{ hashFiles('source/server/rust-server/Cargo.lock') }}
+          restore-keys: rust-
+
+      - name: Build Rust server Release
+        working-directory: source/server/rust-server
+        shell: pwsh
+        run: |
+          $env:RUSTFLAGS = "-Clink-arg=/Brepro"
+          cargo build --release --locked
+
+      - name: Install msvcpp-normalize-pe
+        run: pip install msvcpp-normalize-pe
+
+      - name: Normalize PE headers
+        working-directory: source
+        run: |
+          msvcpp-normalize-pe Release\neverlose.dll
+          msvcpp-normalize-pe Release\injector.exe
+
+      - name: Collect binaries and compute SHA256
+        shell: pwsh
+        run: |
+          $files = @(
+            "source\Release\neverlose.dll",
+            "source\Release\injector.exe",
+            "source\server\rust-server\target\release\neverlose-server.exe"
+          )
+
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+
+          $hashes = @()
+          foreach ($f in $files) {
+            if (!(Test-Path $f)) {
+              throw "Missing expected artifact: $f"
+            }
+
+            $name = Split-Path $f -Leaf
+            Copy-Item $f "dist\$name"
+
+            $hash = (Get-FileHash "dist\$name" -Algorithm SHA256).Hash.ToLower()
+            $hashes += "${hash}  ${name}"
+
+            echo "$name : $hash"
+          }
+
+          $hashes | Out-File -Encoding utf8 "dist\SHA256SUMS.txt"
+          echo "" >> dist\SHA256SUMS.txt
+          echo "Built from commit: $env:SOURCE_COMMIT" >> dist\SHA256SUMS.txt
+
+      - name: Detect prerelease tag
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $isPrerelease = $tag -match "-(test|nightly|alpha|beta|rc)\.?"
+          "IS_PRERELEASE=$($isPrerelease.ToString().ToLower())" >> $env:GITHUB_ENV
+
+      - name: Build release notes
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $notesPath = "release-notes\$tag.md"
+          $bodyPath = "dist\RELEASE_BODY.md"
+          $sourceCommit = $env:SOURCE_COMMIT
+
+          if ([string]::IsNullOrWhiteSpace($sourceCommit)) {
+            $sourceCommit = git -C source rev-parse HEAD
+          }
+
+          if (Test-Path $notesPath) {
+            Get-Content $notesPath | Out-File -Encoding utf8 $bodyPath
+            "" | Out-File -Encoding utf8 -Append $bodyPath
+          } else {
+            @"
+          ## FemboyLose $tag
+
+          No manual changelog was provided for this release.
+
+          "@ | Out-File -Encoding utf8 $bodyPath
+          }
+
+          @"
+          ---
+
+          Built from [$sourceCommit](https://git.femboy.tw/root/FemboyLose/commit/$sourceCommit) on git.femboy.tw.
+          "@ | Out-File -Encoding utf8 -Append $bodyPath
+
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
+        with:
+          prerelease: ${{ env.IS_PRERELEASE }}
+          files: |
+            dist/neverlose.dll
+            dist/injector.exe
+            dist/neverlose-server.exe
+            dist/SHA256SUMS.txt
+          body_path: dist/RELEASE_BODY.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          name: "Neverlose Launcher ${{ github.ref_name }}"
-          body: "Standalone launcher executable built from ${{ github.sha }}."
-          draft: false
-          prerelease: ${{ contains(github.ref_name, '-test') || contains(github.ref_name, '-nightly') || contains(github.ref_name, '-alpha') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-rc') }}
-          files: |
-            dist/NeverloseLauncher.exe
-            dist/SHA256SUMS.txt
