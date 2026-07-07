@@ -20,7 +20,7 @@ jobs:
       - name: Clone source from git.femboy.tw
         shell: pwsh
         run: |
-          git clone https://git.femboy.tw/root/FemboyLose.git source
+          git clone https://gitlab.com/luvettee/FemboyLose.git source
           echo "SOURCE_COMMIT=$(git -C source rev-parse HEAD)" >> $env:GITHUB_ENV
 
       - name: Setup MSBuild
