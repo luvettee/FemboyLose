@@ -4,7 +4,7 @@ This repository contains no source code.
 
 Releases are built automatically by GitHub Actions from the public source repository:
 
-https://git.femboy.tw/root/FemboyLose
+https://gitlab.com/luvettee/femboylose
 
 This repository only exists to provide GitHub-hosted release artifacts, release hashes, and build logs.
 
